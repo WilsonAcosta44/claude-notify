@@ -1,0 +1,7 @@
+node_modules/
+pwa/dist/
+pwa/.env
+functions/.env
+.firebase/
+*.local
+.DS_Store
