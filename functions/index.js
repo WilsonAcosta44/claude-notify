@@ -1,55 +1,67 @@
 const { onRequest } = require("firebase-functions/v2/https");
-const { setGlobalOptions } = require("firebase-functions/v2");
+const { setGlobalOptions, params } = require("firebase-functions/v2");
 const admin = require("firebase-admin");
 const { getFirestore } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
+const crypto = require("crypto");
 
 admin.initializeApp();
 setGlobalOptions({ region: "us-central1" });
 
 const db = getFirestore();
 
+// Shared secret — set via: firebase functions:secrets:set NOTIFY_SECRET
+// Hook sends it as: Authorization: Bearer <secret>
+const NOTIFY_SECRET = process.env.NOTIFY_SECRET || "";
+
+function tokenDocId(fcmToken) {
+  return crypto.createHash("sha256").update(fcmToken).digest("hex");
+}
+
+function checkSecret(req, res) {
+  if (!NOTIFY_SECRET) return true; // secret not configured — allow (warn in logs)
+  const auth = req.headers.authorization || "";
+  const provided = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (provided !== NOTIFY_SECRET) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
 /**
  * POST /notify
- * Called by the Claude Code Stop hook on the user's machine.
- * Reads all registered FCM tokens from Firestore and sends a push to each.
+ * Called by the Claude Code Stop hook. Requires Authorization: Bearer <NOTIFY_SECRET>.
  */
-exports.notify = onRequest({ cors: true }, async (req, res) => {
-  if (req.method === "OPTIONS") {
-    res.set("Access-Control-Allow-Origin", "*");
-    res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    res.status(204).send("");
-    return;
-  }
-
+exports.notify = onRequest({ cors: ["https://claude-notify.web.app"], secrets: ["NOTIFY_SECRET"] }, async (req, res) => {
   if (req.method !== "POST") {
     res.status(405).send("Method Not Allowed");
     return;
   }
 
+  if (!checkSecret(req, res)) return;
+
   const { title = "Claude is waiting", body = "Your session needs input" } =
     req.body || {};
 
   try {
-    // Load all registered push tokens
     const snap = await db.collection("push_tokens").get();
     if (snap.empty) {
       res.status(200).json({ sent: 0, message: "No registered tokens" });
       return;
     }
 
-    const tokens = snap.docs.map((d) => d.data().token).filter(Boolean);
-    if (!tokens.length) {
+    const docs = snap.docs.filter((d) => d.data().token);
+    if (!docs.length) {
       res.status(200).json({ sent: 0, message: "No valid tokens" });
       return;
     }
 
     const messaging = getMessaging();
     const sendResults = await Promise.allSettled(
-      tokens.map((token) =>
+      docs.map((d) =>
         messaging.send({
-          token,
+          token: d.data().token,
           notification: { title, body },
           webpush: {
             notification: {
@@ -66,30 +78,23 @@ exports.notify = onRequest({ cors: true }, async (req, res) => {
       )
     );
 
-    // Remove any tokens that FCM reports as invalid/expired
-    const staleTokens = [];
-    sendResults.forEach((result, i) => {
-      if (
-        result.status === "rejected" &&
-        result.reason?.errorInfo?.code ===
+    // Delete stale docs directly from the snapshot — no second Firestore round-trip,
+    // and no Firestore `in` query (which is capped at 30 items).
+    const staleDocs = docs.filter(
+      (_, i) =>
+        sendResults[i].status === "rejected" &&
+        sendResults[i].reason?.errorInfo?.code ===
           "messaging/registration-token-not-registered"
-      ) {
-        staleTokens.push(tokens[i]);
-      }
-    });
+    );
 
-    if (staleTokens.length) {
+    if (staleDocs.length) {
       const batch = db.batch();
-      const staleSnap = await db
-        .collection("push_tokens")
-        .where("token", "in", staleTokens)
-        .get();
-      staleSnap.forEach((doc) => batch.delete(doc.ref));
+      staleDocs.forEach((doc) => batch.delete(doc.ref));
       await batch.commit();
     }
 
     const sent = sendResults.filter((r) => r.status === "fulfilled").length;
-    res.status(200).json({ sent, total: tokens.length });
+    res.status(200).json({ sent, total: docs.length });
   } catch (err) {
     console.error("notify error:", err);
     res.status(500).json({ error: err.message });
@@ -99,35 +104,25 @@ exports.notify = onRequest({ cors: true }, async (req, res) => {
 /**
  * POST /register
  * Called by the PWA after obtaining an FCM push token.
- * Stores the token in Firestore.
  */
 exports.register = onRequest({ cors: true }, async (req, res) => {
-  if (req.method === "OPTIONS") {
-    res.set("Access-Control-Allow-Origin", "*");
-    res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    res.status(204).send("");
-    return;
-  }
-
   if (req.method !== "POST") {
     res.status(405).send("Method Not Allowed");
     return;
   }
 
   const { token } = req.body || {};
-  if (!token || typeof token !== "string") {
-    res.status(400).json({ error: "token required" });
+  if (!token || typeof token !== "string" || token.length > 4096) {
+    res.status(400).json({ error: "valid token required" });
     return;
   }
 
   try {
-    // Upsert by token value so we don't accumulate duplicates
-    await db.collection("push_tokens").doc(token.slice(0, 100)).set(
+    // Use SHA-256 of the full token as the doc ID — avoids truncation collisions.
+    await db.collection("push_tokens").doc(tokenDocId(token)).set(
       {
         token,
         registeredAt: admin.firestore.FieldValue.serverTimestamp(),
-        userAgent: req.headers["user-agent"] || "",
       },
       { merge: true }
     );
